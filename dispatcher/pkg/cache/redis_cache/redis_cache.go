@@ -21,61 +21,128 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
 	"github.com/go-redis/redis/v8"
+	"go.uber.org/zap"
+	"math/rand"
+	"sync/atomic"
 	"time"
 )
 
+var nopLogger = zap.NewNop()
+
 type RedisCache struct {
-	client *redis.Client
+	// Client is the redis.Client. This must not be nil.
+	Client *redis.Client
+
+	// ClientTimeout specifies the timeout for read and write operations.
+	// Default is 50ms.
+	ClientTimeout time.Duration
+
+	// Logger is the *zap.Logger for this RedisCache.
+	// A nil Logger will disable logging.
+	Logger *zap.Logger
+
+	clientDisabled uint32
 }
 
-// NewRedisCache returns a Redis cache specified by the url.
-// For the format of this url, see redis.ParseURL.
-func NewRedisCache(url string) (*RedisCache, error) {
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		return nil, err
+func (r *RedisCache) logger() *zap.Logger {
+	if l := r.Logger; l != nil {
+		return l
+	}
+	return nopLogger
+}
+
+func (r *RedisCache) clientTimeout() time.Duration {
+	if t := r.ClientTimeout; t > 0 {
+		return t
+	}
+	return time.Millisecond * 50
+}
+
+func (r *RedisCache) disabled() bool {
+	return atomic.LoadUint32(&r.clientDisabled) != 0
+}
+
+func (r *RedisCache) disableClient() {
+	if atomic.CompareAndSwapUint32(&r.clientDisabled, 0, 1) {
+		r.logger().Warn("redis temporarily disabled")
+		go func() {
+			const maxBackoff = time.Second * 30
+			backoff := time.Millisecond * 100
+			for {
+				time.Sleep(backoff)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
+				err := r.Client.Ping(ctx).Err()
+				cancel()
+				if err != nil {
+					if backoff >= maxBackoff {
+						backoff = maxBackoff
+					} else {
+						backoff += time.Duration(rand.Intn(1000))*time.Millisecond + time.Second
+					}
+					r.logger().Warn("redis ping failed", zap.Error(err), zap.Duration("next_ping", backoff))
+					continue
+				}
+				atomic.StoreUint32(&r.clientDisabled, 0)
+				return
+			}
+		}()
+	}
+}
+
+func (r *RedisCache) Get(key string) (v []byte, storedTime, expirationTime time.Time) {
+	if r.disabled() {
+		return nil, time.Time{}, time.Time{}
 	}
 
-	c := redis.NewClient(opt)
-	return &RedisCache{client: c}, nil
-}
-
-func (r *RedisCache) Get(ctx context.Context, key string) (v []byte, storedTime, expirationTime time.Time, err error) {
-	b, err := r.client.Get(ctx, key).Bytes()
+	ctx, cancel := context.WithTimeout(context.Background(), r.clientTimeout())
+	defer cancel()
+	b, err := r.Client.Get(ctx, key).Bytes()
 	if err != nil {
-		if err == redis.Nil { // no such key in redis, suppress redis.Nil err.
-			return nil, time.Time{}, time.Time{}, nil
+		if err != redis.Nil {
+			r.logger().Warn("redis get", zap.Error(err))
+			r.disableClient()
 		}
-		return nil, time.Time{}, time.Time{}, err
+		return nil, time.Time{}, time.Time{}
 	}
 
 	storedTime, expirationTime, m, err := unpackRedisValue(b)
 	if err != nil {
-		return nil, time.Time{}, time.Time{}, fmt.Errorf("failed to unpack redis data: %w", err)
+		r.logger().Warn("redis data unpack error", zap.Error(err))
+		return nil, time.Time{}, time.Time{}
 	}
-
-	return m, storedTime, expirationTime, nil
+	return m, storedTime, expirationTime
 }
 
-func (r *RedisCache) Store(ctx context.Context, key string, v []byte, storedTime, expirationTime time.Time) error {
+// Store stores kv into redis asynchronously.
+func (r *RedisCache) Store(key string, v []byte, storedTime, expirationTime time.Time) {
+	if r.disabled() {
+		return
+	}
+
 	now := time.Now()
 	ttl := expirationTime.Sub(now)
 	if ttl <= 0 { // For redis, zero ttl means the key has no expiration time.
-		return nil
+		return
 	}
 
 	data := packRedisData(storedTime, expirationTime, v)
-	defer data.Release()
 
-	return r.client.Set(ctx, key, data.Bytes(), ttl).Err()
+	go func() {
+		defer data.Release()
+		ctx, cancel := context.WithTimeout(context.Background(), r.clientTimeout())
+		defer cancel()
+		if err := r.Client.Set(ctx, key, data.Bytes(), ttl).Err(); err != nil {
+			r.logger().Warn("redis set", zap.Error(err))
+			r.disableClient()
+		}
+	}()
 }
 
 // Close closes the redis client.
 func (r *RedisCache) Close() error {
-	return r.client.Close()
+	return r.Client.Close()
 }
 
 // packRedisData packs storedTime, expirationTime and v into one byte slice.
