@@ -1,5 +1,5 @@
 This is a fork Version
-v3.5.3
+v3.5.4
 # mosdns
 
 功能概述、配置方式、教程等，详见: [wiki](https://github.com/IrineSistiana/mosdns/wiki)
