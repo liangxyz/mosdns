@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"io"
@@ -17,7 +16,7 @@ import (
 )
 
 func TestTransport_Exchange(t *testing.T) {
-	randSleep20 := func() { time.Sleep(time.Millisecond * time.Duration(rand.Intn(20))) }
+	randSleepMs := func(ms int) { time.Sleep(time.Millisecond * time.Duration(rand.Intn(ms))) }
 	dial := func(ctx context.Context) (net.Conn, error) {
 		c1, c2 := net.Pipe()
 		go func() {
@@ -26,7 +25,7 @@ func TestTransport_Exchange(t *testing.T) {
 				if m != nil {
 					go func() {
 						defer m.Release()
-						randSleep20()
+						randSleepMs(20)
 						dnsutils.WriteRawMsgToTCP(c2, m.Bytes())
 					}()
 				}
@@ -35,7 +34,7 @@ func TestTransport_Exchange(t *testing.T) {
 				}
 			}
 		}()
-		randSleep20()
+		randSleepMs(20)
 		return c1, nil
 	}
 
@@ -43,33 +42,33 @@ func TestTransport_Exchange(t *testing.T) {
 		return nil, errors.New("dial err")
 	}
 
-	write := func(c io.Writer, m []byte) (n int, err error) {
-		randSleep20()
-		return dnsutils.WriteRawMsgToTCP(c, m)
+	write := func(c io.Writer, m *dns.Msg) (n int, err error) {
+		randSleepMs(20)
+		return dnsutils.WriteMsgToTCP(c, m)
 	}
 
-	read := func(c io.Reader) (m *pool.Buffer, n int, err error) {
-		randSleep20()
-		return dnsutils.ReadRawMsgFromTCP(c)
+	read := func(c io.Reader) (m *dns.Msg, n int, err error) {
+		randSleepMs(20)
+		return dnsutils.ReadMsgFromTCP(c)
 	}
 
-	writeErr := func(c io.Writer, m []byte) (n int, err error) {
+	writeErr := func(c io.Writer, m *dns.Msg) (n int, err error) {
 		return 0, errors.New("write err")
 	}
 
-	readErr := func(c io.Reader) (m *pool.Buffer, n int, err error) {
+	readErr := func(c io.Reader) (m *dns.Msg, n int, err error) {
 		return nil, 0, errors.New("read err")
 	}
 
-	readTimeout := func(c io.Reader) (m *pool.Buffer, n int, err error) {
+	readTimeout := func(c io.Reader) (m *dns.Msg, n int, err error) {
 		time.Sleep(time.Second * 1)
 		return nil, 0, errors.New("read err")
 	}
 
 	type fields struct {
 		DialFunc       func(ctx context.Context) (net.Conn, error)
-		WriteFunc      func(c io.Writer, m []byte) (n int, err error)
-		ReadFunc       func(c io.Reader) (m *pool.Buffer, n int, err error)
+		WriteFunc      func(c io.Writer, m *dns.Msg) (n int, err error)
+		ReadFunc       func(c io.Reader) (m *dns.Msg, n int, err error)
 		MaxConns       int
 		IdleTimeout    time.Duration
 		EnablePipeline bool
@@ -277,11 +276,7 @@ func TestTransport_Exchange(t *testing.T) {
 			if tt.wantErr {
 				q := new(dns.Msg)
 				q.SetQuestion(".", dns.TypeA)
-				raw, err := q.Pack()
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, err = transport.ExchangeContext(ctx, raw)
+				_, err := transport.ExchangeContext(ctx, q)
 				if err == nil {
 					t.Fatal("want err, but got nil err")
 				}
@@ -293,27 +288,16 @@ func TestTransport_Exchange(t *testing.T) {
 				i := i
 				go func() {
 					defer wg.Done()
-					randSleep20()
+					randSleepMs(100)
 					q := new(dns.Msg)
 					qName := fmt.Sprintf("%d.", i)
 					q.SetQuestion(qName, dns.TypeA)
-					raw, err := q.Pack()
-					if err != nil {
-						t.Error(err)
-						return
-					}
 					ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
 					defer cancel()
 
-					gotR, err := transport.ExchangeContext(ctx, raw)
+					r, err := transport.ExchangeContext(ctx, q)
 					if (err != nil) != tt.wantErr {
 						t.Errorf("Exchange() error = %v, wantErr %v", err, tt.wantErr)
-						return
-					}
-
-					r := new(dns.Msg)
-					if err := r.Unpack(gotR.Bytes()); err != nil {
-						t.Error(err)
 						return
 					}
 
@@ -328,15 +312,25 @@ func TestTransport_Exchange(t *testing.T) {
 			}
 
 			wg.Wait()
-			time.Sleep(tt.fields.IdleTimeout + time.Millisecond*100)
+			time.Sleep(tt.fields.IdleTimeout + time.Millisecond*200)
 
 			transport.pm.Lock()
+			for conn := range transport.pConns {
+				if conn.isClosed() {
+					delete(transport.pConns, conn)
+				}
+			}
 			if n := len(transport.pConns); n != 0 {
 				t.Errorf("len(t.pConns), want 0, got %d", n)
 			}
 
-			if n := len(transport.dCalls); n != 0 {
-				t.Errorf("len(t.pConns), want 0, got %d", n)
+			for conn := range transport.opConns {
+				if ok := conn.stopIdle(); !ok {
+					delete(transport.opConns, conn)
+				}
+			}
+			if n := len(transport.opConns); n != 0 {
+				t.Errorf("len(t.opConns), want 0, got %d", n)
 			}
 			transport.pm.Unlock()
 		})

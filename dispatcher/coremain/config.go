@@ -18,19 +18,15 @@
 package coremain
 
 import (
+	"bytes"
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/handler"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/mlog"
 	"gopkg.in/yaml.v3"
 	"os"
 )
 
-// Config is config
 type Config struct {
-	Log struct {
-		Level    string `yaml:"level"`
-		File     string `yaml:"file"`
-		ErrFile  string `yaml:"err_file"`
-		InfoFile string `yaml:"info_file"`
-	} `yaml:"log"`
+	Log     mlog.LogConfig    `yaml:"log"`
 	Library []string          `yaml:"library"`
 	Plugin  []*handler.Config `yaml:"plugin"`
 	Include []string          `yaml:"include"`
@@ -49,7 +45,9 @@ func parseConfig(f string) (*Config, error) {
 	}
 
 	c := new(Config)
-	if err := yaml.Unmarshal(b, c); err != nil {
+	yamlDecoder := yaml.NewDecoder(bytes.NewReader(b))
+	yamlDecoder.KnownFields(true)
+	if err := yamlDecoder.Decode(c); err != nil {
 		return nil, err
 	}
 
