@@ -21,81 +21,179 @@ package transport
 
 import (
 	"context"
-	"github.com/miekg/dns"
+	"errors"
+	"net"
 	"sync"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"go.uber.org/zap"
 )
 
-type ReuseConnTransport struct {
-	ReuseConnOpts
+const (
+	// Most servers will send SERVFAIL after 3~5s. If no resp, connection may be dead.
+	reuseConnQueryTimeout = time.Second * 6
+)
 
-	m          sync.Mutex // protect following fields
-	closed     bool
-	idledConns []*dnsConn
-	conns      map[*dnsConn]struct{}
+// ReuseConnTransport is for old tcp protocol. (no pipelining)
+type ReuseConnTransport struct {
+	dialFunc    func(ctx context.Context) (NetConn, error)
+	dialTimeout time.Duration
+	idleTimeout time.Duration
+	logger      *zap.Logger // non-nil
+	ctx         context.Context
+	ctxCancel   context.CancelCauseFunc
+
+	m         sync.Mutex // protect following fields
+	closed    bool
+	idleConns map[*reusableConn]struct{}
+	conns     map[*reusableConn]struct{}
+
+	// for testing
+	testWaitRespTimeout time.Duration
 }
 
 type ReuseConnOpts struct {
-	IOOpts
+	// DialContext specifies the method to dial a connection to the server.
+	// DialContext MUST NOT be nil.
+	DialContext func(ctx context.Context) (NetConn, error)
+
+	// DialTimeout specifies the timeout for DialFunc.
+	// Default is defaultDialTimeout.
+	DialTimeout time.Duration
+
+	// Default is defaultIdleTimeout
+	IdleTimeout time.Duration
+
+	Logger *zap.Logger
 }
 
 func NewReuseConnTransport(opt ReuseConnOpts) *ReuseConnTransport {
-	return &ReuseConnTransport{
-		ReuseConnOpts: opt,
-		conns:         make(map[*dnsConn]struct{}),
+	ctx, cancel := context.WithCancelCause(context.Background())
+	t := &ReuseConnTransport{
+		ctx:       ctx,
+		ctxCancel: cancel,
+		idleConns: make(map[*reusableConn]struct{}),
+		conns:     make(map[*reusableConn]struct{}),
 	}
+	t.dialFunc = opt.DialContext
+	setDefaultGZ(&t.dialTimeout, opt.DialTimeout, defaultDialTimeout)
+	setDefaultGZ(&t.idleTimeout, opt.IdleTimeout, defaultIdleTimeout)
+	setNonNilLogger(&t.logger, opt.Logger)
+
+	return t
 }
 
-func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
-	const maxAttempt = 3
+func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*[]byte, error) {
+	const maxRetry = 2
 
-	attempt := 0
+	retry := 0
 	for {
-		attempt++
-		conn, isNewConn, err := t.getReusableConn()
+		var isNewConn bool
+		c, err := t.getIdleConn()
+		if err != nil {
+			return nil, err
+		}
+		if c == nil {
+			isNewConn = true
+			c, err = t.getNewConn(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		queryPayload, err := copyMsgWithLenHdr(m)
 		if err != nil {
 			return nil, err
 		}
 
-		r, err := conn.exchange(ctx, m)
-		t.releaseReusableConn(conn, err)
+		resp, err := c.exchange(ctx, queryPayload)
 		if err != nil {
-			if !isNewConn && attempt <= maxAttempt && ctx.Err() == nil {
-				continue
+			if !isNewConn && retry <= maxRetry {
+				retry++
+				continue // retry if c is a reused connection.
 			}
 			return nil, err
 		}
-
-		return r, nil
+		return resp, nil
 	}
 }
 
-// getReusableConn returns a *dnsConn.
-// Returned bool indicates whether this dnsConn is a reused connection.
-// The caller must call releaseReusableConn to release the dnsConn.
-func (t *ReuseConnTransport) getReusableConn() (*dnsConn, bool, error) {
-	t.m.Lock()
-	if t.closed {
-		return nil, false, errClosedTransport
+// getNewConn dial a *reusableConn.
+// The caller must call releaseReusableConn to release the reusableConn.
+func (t *ReuseConnTransport) getNewConn(ctx context.Context) (*reusableConn, error) {
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type dialRes struct {
+		c   *reusableConn
+		err error
 	}
-	for {
-		// prefer to use the latest connection
-		dc, _ := slicePopLatest(&t.idledConns)
-		if dc == nil { // no idled connection
-			break
+	dialChan := make(chan dialRes)
+	go func() {
+		dialCtx, cancelDial := context.WithTimeout(t.ctx, t.dialTimeout)
+		defer cancelDial()
+
+		var rc *reusableConn
+		c, err := t.dialFunc(dialCtx)
+		if err != nil {
+			t.logger.Check(zap.WarnLevel, "fail to dial reusable conn").Write(zap.Error(err))
 		}
-		if !dc.isClosed() {
-			t.m.Unlock()
-			return dc, true, nil
+		if c != nil {
+			rc = t.newReusableConn(c)
+			if rc == nil { // transport closed
+				c.Close()
+				rc = nil
+				err = ErrClosedTransport
+			}
 		}
-		// connection was closed, delete it from the pool and retry
-		delete(t.conns, dc)
+
+		select {
+		case dialChan <- dialRes{c: rc, err: err}:
+		case <-callCtx.Done(): // caller canceled getNewConn() call
+			if rc != nil { // put this conn to pool
+				t.setIdle(rc)
+			}
+		}
+	}()
+
+	select {
+	case <-callCtx.Done():
+		return nil, context.Cause(ctx)
+	case <-t.ctx.Done():
+		return nil, context.Cause(t.ctx)
+	case res := <-dialChan:
+		return res.c, res.err
+	}
+}
+
+func (t *ReuseConnTransport) setIdle(c *reusableConn) {
+	t.m.Lock()
+	defer t.m.Unlock()
+	if t.closed {
+		return
+	}
+	if _, ok := t.conns[c]; ok {
+		t.idleConns[c] = struct{}{}
+	}
+}
+
+// getIdleConn returns a *reusableConn from conn pool, or nil if no conn
+// is idle.
+// The caller must call releaseReusableConn to release the reusableConn.
+func (t *ReuseConnTransport) getIdleConn() (*reusableConn, error) {
+	t.m.Lock()
+	defer t.m.Unlock()
+	if t.closed {
+		return nil, ErrClosedTransport
 	}
 
-	// No idled connection, need to dial a one for this query.
-	dc := newDnsConn(t.IOOpts)
-	t.conns[dc] = struct{}{}
-	t.m.Unlock()
-	return dc, false, nil
+	for c := range t.idleConns {
+		delete(t.idleConns, c)
+		return c, nil
+	}
+	return nil, nil
 }
 
 // Close closes ReuseConnTransport and all its connections.
@@ -107,34 +205,137 @@ func (t *ReuseConnTransport) Close() error {
 		return nil
 	}
 	t.closed = true
-	for conn := range t.conns {
-		conn.closeWithErr(errClosedTransport)
+	for c := range t.conns {
+		delete(t.conns, c)
+		delete(t.idleConns, c)
+		c.closeWithErrByTransport(ErrClosedTransport)
 	}
+	t.ctxCancel(ErrClosedTransport)
 	return nil
 }
 
-// If err != nil, the released dnsConn will be closed instead of
-// returning to the conn pool.
-func (t *ReuseConnTransport) releaseReusableConn(c *dnsConn, err error) {
-	var closeConn bool
+type reusableConn struct {
+	c NetConn
+	t *ReuseConnTransport
+
+	m           sync.Mutex
+	waitingResp chan *[]byte
+
+	closeOnce   sync.Once
+	closeNotify chan struct{}
+	closeErr    error
+}
+
+// return nil if transport was closed
+func (t *ReuseConnTransport) newReusableConn(c NetConn) *reusableConn {
+	rc := &reusableConn{
+		c:           c,
+		t:           t,
+		closeNotify: make(chan struct{}),
+	}
+
 	t.m.Lock()
-	// t was closed, this connection is now an orphan and should be closed.
-	// In fact, this connection has been closed when t was closed.
-	if t.closed {
-		closeConn = true
-		err = errClosedTransport
-	} else {
-		// close this connection if it had an error.
+	if t.closed { // t was closed.
+		t.m.Unlock()
+		return nil
+	}
+	t.conns[rc] = struct{}{}
+	t.m.Unlock()
+	go rc.readLoop()
+	return rc
+}
+
+var (
+	errUnexpectedResp = errors.New("server misbehaving: unexpected response")
+)
+
+func (c *reusableConn) readLoop() {
+	for {
+		resp, err := dnsutils.ReadRawMsgFromTCP(c.c)
 		if err != nil {
-			delete(t.conns, c)
-			closeConn = true
-		} else { // looks good, put it into pool.
-			sliceAdd(&t.idledConns, c)
+			c.closeWithErr(err)
+			return
+		}
+
+		c.m.Lock()
+		respChan := c.waitingResp
+		c.waitingResp = nil
+		c.m.Unlock()
+
+		if respChan == nil {
+			pool.ReleaseBuf(resp)
+			c.closeWithErr(errUnexpectedResp)
+			return
+		}
+
+		// This connection is idled again.
+		c.c.SetReadDeadline(time.Now().Add(c.t.idleTimeout))
+		// Note: calling setIdle before sending resp back to make sure this connection is idle
+		// before Exchange call returning. Otherwise, Test_ReuseConnTransport may fail.
+		c.t.setIdle(c)
+
+		select {
+		case respChan <- resp:
+		default:
+			panic("bug: respChan has buffer, we shouldn't reach here")
 		}
 	}
-	t.m.Unlock()
+}
 
-	if closeConn {
+func (c *reusableConn) closeWithErr(err error) {
+	if err == nil {
+		err = net.ErrClosed
+	}
+	c.closeOnce.Do(func() {
+		c.t.m.Lock()
+		delete(c.t.conns, c)
+		delete(c.t.idleConns, c)
+		c.t.m.Unlock()
+
+		c.closeErr = err
+		c.c.Close()
+		close(c.closeNotify)
+	})
+}
+
+func (c *reusableConn) closeWithErrByTransport(err error) {
+	if err == nil {
+		err = net.ErrClosed
+	}
+	c.closeOnce.Do(func() {
+		c.closeErr = err
+		c.c.Close()
+		close(c.closeNotify)
+	})
+}
+
+func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error) {
+	respChan := make(chan *[]byte, 1)
+	c.m.Lock()
+	if c.waitingResp != nil {
+		c.m.Unlock()
+		panic("bug: reusableConn: concurrent exchange calls")
+	}
+	c.waitingResp = respChan
+	c.m.Unlock()
+
+	waitRespTimeout := reuseConnQueryTimeout
+	if c.t.testWaitRespTimeout > 0 {
+		waitRespTimeout = c.t.testWaitRespTimeout
+	}
+	c.c.SetDeadline(time.Now().Add(waitRespTimeout))
+	_, err := c.c.Write(*q)
+	if err != nil {
 		c.closeWithErr(err)
+		return nil, err
+	}
+
+	select {
+	case resp := <-respChan:
+		return resp, nil
+	case <-c.closeNotify:
+		return nil, c.closeErr
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
 	}
 }

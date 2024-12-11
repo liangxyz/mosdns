@@ -24,15 +24,16 @@ package ipset
 import (
 	"context"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
-	"github.com/miekg/dns"
-	"github.com/vishvananda/netlink"
 	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/miekg/dns"
+	"github.com/vishvananda/netlink"
 )
 
 func skipTest(t *testing.T) {

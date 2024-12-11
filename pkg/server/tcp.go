@@ -21,52 +21,48 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"net"
+	"net/netip"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v5/pkg/server/dns_handler"
-	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"go.uber.org/zap"
-	"net"
-	"time"
 )
 
 const (
 	defaultTCPIdleTimeout = time.Second * 10
-	tcpFirstReadTimeout   = time.Millisecond * 500
+	tcpFirstReadTimeout   = time.Second * 2
 )
 
-type TCPServer struct {
-	opts TCPServerOpts
-}
-
-func NewTCPServer(opts TCPServerOpts) *TCPServer {
-	opts.init()
-	return &TCPServer{opts: opts}
-}
-
 type TCPServerOpts struct {
-	DNSHandler  dns_handler.Handler // Required.
-	Logger      *zap.Logger
-	IdleTimeout time.Duration
-}
+	// Nil logger == nop
+	Logger *zap.Logger
 
-func (opts *TCPServerOpts) init() {
-	if opts.Logger == nil {
-		opts.Logger = mlog.Nop()
-	}
-	utils.SetDefaultNum(&opts.IdleTimeout, defaultTCPIdleTimeout)
-	return
+	// Default is defaultTCPIdleTimeout.
+	IdleTimeout time.Duration
 }
 
 // ServeTCP starts a server at l. It returns if l had an Accept() error.
 // It always returns a non-nil error.
-func (s *TCPServer) ServeTCP(l net.Listener) error {
-	// handle listener
-	listenerCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
+	logger := opts.Logger
+	if logger == nil {
+		logger = nopLogger
+	}
+	idleTimeout := opts.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultTCPIdleTimeout
+	}
+	firstReadTimeout := tcpFirstReadTimeout
+	if idleTimeout < firstReadTimeout {
+		firstReadTimeout = idleTimeout
+	}
+
+	listenerCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(errListenerCtxCanceled)
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -74,18 +70,10 @@ func (s *TCPServer) ServeTCP(l net.Listener) error {
 		}
 
 		// handle connection
-		tcpConnCtx, cancelConn := context.WithCancel(listenerCtx)
+		tcpConnCtx, cancelConn := context.WithCancelCause(listenerCtx)
 		go func() {
 			defer c.Close()
-			defer cancelConn()
-
-			firstReadTimeout := tcpFirstReadTimeout
-			idleTimeout := s.opts.IdleTimeout
-			if idleTimeout < firstReadTimeout {
-				firstReadTimeout = idleTimeout
-			}
-
-			clientAddr := utils.GetAddrFromAddr(c.RemoteAddr())
+			defer cancelConn(errConnectionCtxCanceled)
 
 			firstRead := true
 			for {
@@ -100,26 +88,28 @@ func (s *TCPServer) ServeTCP(l net.Listener) error {
 					return // read err, close the connection
 				}
 
+				// Try to get server name from tls conn.
+				var serverName string
+				if tlsConn, ok := c.(*tls.Conn); ok {
+					serverName = tlsConn.ConnectionState().ServerName
+				}
+
 				// handle query
 				go func() {
-					qCtx := query_context.NewContext(req)
-					query_context.SetClientAddr(qCtx, &clientAddr)
-					if err := s.opts.DNSHandler.ServeDNS(tcpConnCtx, qCtx); err != nil {
-						s.opts.Logger.Warn("handler err", zap.Error(err))
-						c.Close()
+					var clientAddr netip.Addr
+					ta, ok := c.RemoteAddr().(*net.TCPAddr)
+					if ok {
+						clientAddr = ta.AddrPort().Addr()
+					}
+					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
+					if r == nil {
+						c.Close() // abort the connection
 						return
 					}
-					r := qCtx.R()
+					defer pool.ReleaseBuf(r)
 
-					b, buf, err := pool.PackBuffer(r)
-					if err != nil {
-						s.opts.Logger.Error("failed to unpack handler's response", zap.Error(err), zap.Stringer("msg", r))
-						return
-					}
-					defer pool.ReleaseBuf(buf)
-
-					if _, err := dnsutils.WriteRawMsgToTCP(c, b); err != nil {
-						s.opts.Logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
+					if _, err := c.Write(*r); err != nil {
+						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 						return
 					}
 				}()

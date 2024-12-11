@@ -21,50 +21,23 @@ package transport
 
 import (
 	"context"
-	"github.com/miekg/dns"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/miekg/dns"
+	"github.com/stretchr/testify/require"
 )
 
-// Leak and race tests.
 func Test_ReuseConnTransport(t *testing.T) {
-	// no error
-	testReuseConnTransport(t, IOOpts{
-		DialFunc:  dial,
-		WriteFunc: write,
-		ReadFunc:  read,
-	})
+	const idleTimeout = time.Second * 5
+	r := require.New(t)
 
-	// dnsConn error
-	testReuseConnTransport(t, IOOpts{
-		DialFunc:  dialErr,
-		WriteFunc: write,
-		ReadFunc:  read,
-	})
-	testReuseConnTransport(t, IOOpts{
-		DialFunc:  dial,
-		WriteFunc: writeErr,
-		ReadFunc:  read,
-	})
-	testReuseConnTransport(t, IOOpts{
-		DialFunc:  dial,
-		WriteFunc: write,
-		ReadFunc:  readErr,
-	})
-
-	// random err
-	testReuseConnTransport(t, IOOpts{
-		DialFunc:  dialErrP,
-		WriteFunc: writeErrP,
-		ReadFunc:  readErrP,
-	})
-}
-
-func testReuseConnTransport(t *testing.T, ioOpts IOOpts) {
-	t.Helper()
 	po := ReuseConnOpts{
-		IOOpts: ioOpts,
+		DialContext: func(ctx context.Context) (NetConn, error) {
+			return newDummyEchoNetConn(0, 0, 0), nil
+		},
+		IdleTimeout: idleTimeout,
 	}
 	rt := NewReuseConnTransport(po)
 	defer rt.Close()
@@ -73,27 +46,109 @@ func testReuseConnTransport(t *testing.T, ioOpts IOOpts) {
 	defer cancel()
 	q := new(dns.Msg)
 	q.SetQuestion("test.", dns.TypeA)
-	connsNum := 4
+	queryPayload, err := q.Pack()
+	r.NoError(err)
+	concurrentQueryNum := 10
 	for l := 0; l < 4; l++ {
 		wg := new(sync.WaitGroup)
-		for i := 0; i < connsNum; i++ {
+		for i := 0; i < concurrentQueryNum; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = rt.ExchangeContext(ctx, q)
+				_, err := rt.ExchangeContext(ctx, queryPayload)
+				if err != nil {
+					t.Error(err)
+				}
 			}()
 		}
 		wg.Wait()
+		if t.Failed() {
+			return
+		}
 	}
 
 	rt.m.Lock()
-	pl := len(rt.conns)
-	il := len(rt.idledConns)
+	connNum := len(rt.conns)
+	idledConnNum := len(rt.idleConns)
 	rt.m.Unlock()
-	if pl > connsNum {
-		t.Fatalf("max %d active conn, but got %d active conn(s)", connsNum, pl)
+
+	r.Equal(0, connNum-idledConnNum, "there should be no active conn")
+	r.Equal(concurrentQueryNum, connNum)
+	r.Equal(concurrentQueryNum, idledConnNum, "all conn should be in idle status")
+}
+
+func Test_ReuseConnTransport_Read_err_and_close(t *testing.T) {
+	const idleTimeout = time.Second * 5
+	r := require.New(t)
+
+	po := ReuseConnOpts{
+		DialContext: func(ctx context.Context) (NetConn, error) {
+			return newDummyEchoNetConn(1, 0, 0), nil // 100% read err
+		},
+		IdleTimeout: idleTimeout,
 	}
-	if il > connsNum {
-		t.Fatalf("max %d active conn, but got %d idled conn(s)", connsNum, pl)
+	rt := NewReuseConnTransport(po)
+	defer rt.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	q := new(dns.Msg)
+	q.SetQuestion("test.", dns.TypeA)
+	queryPayload, err := q.Pack()
+	r.NoError(err)
+
+	wg := new(sync.WaitGroup)
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := rt.ExchangeContext(ctx, queryPayload)
+			r.Error(err)
+		}()
+		if t.Failed() {
+			return
+		}
 	}
+	wg.Wait()
+
+	rt.m.Lock()
+	connNum := len(rt.conns)
+	idledConnNum := len(rt.idleConns)
+	rt.m.Unlock()
+
+	r.Equal(0, connNum)
+	r.Equal(0, idledConnNum)
+}
+
+func Test_ReuseConnTransport_conn_lose_and_close(t *testing.T) {
+	r := require.New(t)
+	po := ReuseConnOpts{
+		DialContext: func(ctx context.Context) (NetConn, error) {
+			return newDummyEchoNetConn(0, time.Second, 0), nil // 100% read timeout
+		},
+	}
+	rt := NewReuseConnTransport(po)
+	defer rt.Close()
+	rt.testWaitRespTimeout = time.Millisecond * 1
+
+	q := new(dns.Msg)
+	q.SetQuestion("test.", dns.TypeA)
+	queryPayload, err := q.Pack()
+	r.NoError(err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
+	defer cancel()
+	_, err = rt.ExchangeContext(ctx, queryPayload) // canceled ctx
+	r.Error(err)
+
+	time.Sleep(time.Millisecond * 100)
+
+	rt.m.Lock()
+	connNum := len(rt.conns)
+	idledConnNum := len(rt.idleConns)
+	rt.m.Unlock()
+
+	// connection should be closed and removed
+	r.Equal(0, connNum)
+	r.Equal(0, idledConnNum)
 }

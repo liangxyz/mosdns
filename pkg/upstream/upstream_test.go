@@ -24,12 +24,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
-	"github.com/miekg/dns"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/miekg/dns"
 )
 
 func newUDPTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownFunc func()) {
@@ -68,6 +69,9 @@ func newTCPTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownF
 func newDoTTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownFunc func()) {
 	serverName := "test"
 	cert, err := utils.GenerateCertificate(serverName)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tlsConfig := new(tls.Config)
 	tlsConfig.Certificates = []tls.Certificate{cert}
 	tlsListener, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
@@ -127,7 +131,6 @@ func Test_fastUpstream(t *testing.T) {
 							scheme+"://"+addr,
 							Opt{
 								IdleTimeout: time.Second,
-								MaxConns:    5,
 								TLSConfig:   &tls.Config{InsecureSkipVerify: true},
 							},
 						)
@@ -172,16 +175,31 @@ func testUpstream(u Upstream) error {
 			q := new(dns.Msg)
 			q.SetQuestion("example.com.", dns.TypeA)
 			q.Id = i
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			r, err := u.ExchangeContext(ctx, q)
-
+			queryPayload, err := q.Pack()
 			if err != nil {
 				logErr(err)
 				return
 			}
-			if r.Id != q.Id {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			r, err := u.ExchangeContext(ctx, queryPayload)
+			if err != nil {
+				logErr(err)
+				return
+			}
+
+			resp := new(dns.Msg)
+			err = resp.Unpack(*r)
+			if err != nil {
+				logErr(err)
+				return
+			}
+			if q.Id != resp.Id {
 				logErr(dns.ErrId)
+				return
+			}
+			if !resp.Response {
+				logErr(fmt.Errorf("resp is not a resp bit"))
 				return
 			}
 		}()

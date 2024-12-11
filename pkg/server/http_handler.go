@@ -17,69 +17,64 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package http_handler
+package server
 
 import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/mlog"
-	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v5/pkg/server/dns_handler"
-	"github.com/miekg/dns"
-	"go.uber.org/zap"
 	"io"
 	"net/http"
 	"net/netip"
 	"strings"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/miekg/dns"
+	"go.uber.org/zap"
 )
 
-type HandlerOpts struct {
-	// DNSHandler is required.
-	DNSHandler dns_handler.Handler
-
-	// SrcIPHeader specifies the header that contain client source address.
+type HttpHandlerOpts struct {
+	// GetSrcIPFromHeader specifies the header that contain client source address.
 	// e.g. "X-Forwarded-For".
-	SrcIPHeader string
+	GetSrcIPFromHeader string
 
 	// Logger specifies the logger which Handler writes its log to.
 	// Default is a nop logger.
 	Logger *zap.Logger
 }
 
-func (opts *HandlerOpts) init() {
-	if opts.Logger == nil {
-		opts.Logger = mlog.Nop()
+type HttpHandler struct {
+	dnsHandler  Handler
+	logger      *zap.Logger
+	srcIPHeader string
+}
+
+var _ http.Handler = (*HttpHandler)(nil)
+
+func NewHttpHandler(h Handler, opts HttpHandlerOpts) *HttpHandler {
+	hh := new(HttpHandler)
+	hh.dnsHandler = h
+	hh.srcIPHeader = opts.GetSrcIPFromHeader
+	hh.logger = opts.Logger
+	if hh.logger == nil {
+		hh.logger = nopLogger
 	}
-	return
+	return hh
 }
 
-type Handler struct {
-	opts HandlerOpts
+func (h *HttpHandler) warnErr(req *http.Request, msg string, err error) {
+	h.logger.Warn(msg, zap.String("from", req.RemoteAddr), zap.String("method", req.Method), zap.String("url", req.RequestURI), zap.Error(err))
 }
 
-func NewHandler(opts HandlerOpts) *Handler {
-	opts.init()
-	return &Handler{opts: opts}
-}
-
-func (h *Handler) warnErr(req *http.Request, msg string, err error) {
-	h.opts.Logger.Warn(msg, zap.String("from", req.RemoteAddr), zap.String("method", req.Method), zap.String("url", req.RequestURI), zap.Error(err))
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	addrPort, err := netip.ParseAddrPort(req.RemoteAddr)
-	if err != nil {
-		h.opts.Logger.Error("failed to parse request remote addr", zap.String("addr", req.RemoteAddr), zap.Error(err))
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// If server is on unix domain socket, RemoteAddr is not ip:port.
+	// Just ignore it.
+	// https://github.com/IrineSistiana/mosdns/issues/830
+	addrPort, _ := netip.ParseAddrPort(req.RemoteAddr)
 	clientAddr := addrPort.Addr()
 
 	// read remote addr from header
-	if header := h.opts.SrcIPHeader; len(header) != 0 {
+	if header := h.srcIPHeader; len(header) != 0 {
 		if xff := req.Header.Get(header); len(xff) != 0 {
 			addr, err := readClientAddrFromXFF(xff)
 			if err != nil {
@@ -99,23 +94,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	qCtx := query_context.NewContext(q)
-	query_context.SetClientAddr(qCtx, &clientAddr)
-	if err := h.opts.DNSHandler.ServeDNS(req.Context(), qCtx); err != nil {
-		panic(err.Error()) // Force http server to close connection.
+	queryMeta := QueryMeta{
+		ClientAddr: clientAddr,
 	}
-	r := qCtx.R()
-	b, buf, err := pool.PackBuffer(r)
-	if err != nil {
+	if u := req.URL; u != nil {
+		queryMeta.UrlPath = u.Path
+	}
+	if tlsStat := req.TLS; tlsStat != nil {
+		queryMeta.ServerName = tlsStat.ServerName
+	}
+	resp := h.dnsHandler.Handle(req.Context(), q, queryMeta, pool.PackBuffer)
+	if resp == nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		h.warnErr(req, "failed to unpack handler's response", err)
 		return
 	}
-	defer pool.ReleaseBuf(buf)
-
+	defer pool.ReleaseBuf(resp)
 	w.Header().Set("Content-Type", "application/dns-message")
-	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", dnsutils.GetMinimalTTL(r)))
-	if _, err := w.Write(b); err != nil {
+	if _, err := w.Write(*resp); err != nil {
 		h.warnErr(req, "failed to write response", err)
 		return
 	}

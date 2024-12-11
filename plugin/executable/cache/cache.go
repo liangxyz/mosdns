@@ -24,6 +24,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
@@ -37,13 +45,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
-	"io"
-	"net/http"
-	"os"
-	"strconv"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 const (
@@ -60,7 +61,7 @@ const (
 	expiredMsgTtl            = 5
 
 	minimumChangesToDump   = 1024
-	dumpHeader             = "mosdns_cache_v1"
+	dumpHeader             = "mosdns_cache_v2"
 	dumpBlockSize          = 128
 	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
 )
@@ -202,7 +203,6 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	if cachedResp != nil { // cache hit
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
-		shuffleIP(cachedResp)
 		qCtx.SetResponse(cachedResp)
 	}
 
@@ -379,7 +379,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			return fmt.Errorf("failed to pack msg, %w", err)
 		}
 		e := &CachedEntry{
-			Key:                 string(k),
+			Key:                 []byte(k),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
 			MsgExpirationTime:   v.expirationTime.Unix(),
 			Msg:                 msg,
@@ -420,27 +420,27 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 	readBlock := func() error {
 		h := pool.GetBuf(8)
 		defer pool.ReleaseBuf(h)
-		_, err := io.ReadFull(gr, h)
+		_, err := io.ReadFull(gr, *h)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return errReadHeaderEOF
 			}
 			return fmt.Errorf("failed to read block header, %w", err)
 		}
-		u := binary.BigEndian.Uint64(h)
+		u := binary.BigEndian.Uint64(*h)
 		if u > dumpMaximumBlockLength {
 			return fmt.Errorf("invalid header, block length is big, %d", u)
 		}
 
 		b := pool.GetBuf(int(u))
 		defer pool.ReleaseBuf(b)
-		_, err = io.ReadFull(gr, b)
+		_, err = io.ReadFull(gr, *b)
 		if err != nil {
 			return fmt.Errorf("failed to read block data, %w", err)
 		}
 
 		block := new(CacheDumpBlock)
-		if err := proto.Unmarshal(b, block); err != nil {
+		if err := proto.Unmarshal(*b, block); err != nil {
 			return fmt.Errorf("failed to decode block data, %w", err)
 		}
 
